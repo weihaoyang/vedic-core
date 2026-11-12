@@ -1,0 +1,157 @@
+import { getCivilDateTime } from "@/lib/profile/normalize";
+import { toZonedDate } from "@/lib/qimen/timezone";
+import { calculateChart } from "celestine";
+import type { NormalizedProfileInput } from "@/lib/profile";
+import type { AstroChart, AstroAspect, AstroPoint, AstroPattern, AstroHouseCusp, AstroLot, ZodiacSign } from "./types";
+
+const SIGNS: ZodiacSign[] = ["白羊", "金牛", "双子", "巨蟹", "狮子", "处女", "天秤", "天蝎", "射手", "摩羯", "水瓶", "双鱼"];
+const EN_SIGNS = ["Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo", "Libra", "Scorpio", "Sagittarius", "Capricorn", "Aquarius", "Pisces"];
+const PLANET_NAMES: Record<string, string> = {
+  Sun: "太阳",
+  Moon: "月亮",
+  Mercury: "水星",
+  Venus: "金星",
+  Mars: "火星",
+  Jupiter: "木星",
+  Saturn: "土星",
+  Uranus: "天王",
+  Neptune: "海王",
+  Pluto: "冥王",
+  // 小行星与凯龙（celestine 默认一并计算，本仓不再丢弃）
+  Chiron: "凯龙星",
+  Ceres: "谷神星",
+  Pallas: "智神星",
+  Juno: "婚神星",
+  Vesta: "灶神星",
+  // 黄白交点与莉莉丝（celestine 的 nodes / lilith 列表）
+  "True North Node": "北交点",
+  "True South Node": "南交点",
+  "Mean North Node": "北交点（平）",
+  "Mean South Node": "南交点（平）",
+  "Mean Lilith": "莉莉丝",
+  "True Lilith": "莉莉丝（真）",
+};
+const parse = (value: string) => {
+  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/);
+  if (!match) throw new Error("出生时间格式无效。");
+  return match.slice(1).map((part) => Number(part ?? 0)) as [number, number, number, number, number, number];
+};
+export const offsetMinutes = (datetime: string, timeZone: string) => {
+  const wallTime = toZonedDate(datetime, "UTC").getTime();
+  return (wallTime - toZonedDate(datetime, timeZone).getTime()) / 60_000;
+};
+// Keep the actual sign when display rounding would produce an impossible 30°.
+const degreeWithinSign = (longitude: number) => {
+  const degree = longitude % 30;
+  const rounded = Number(degree.toFixed(2));
+  return Math.min(rounded, 29.99);
+};
+const emptyPoint = (name: string): AstroPoint => ({ name, longitude: null, sign: "未知", degree: null, house: null });
+
+/**
+ * 阿拉伯点中文名。仅映射 celestine 已经算出的 lot，不自行新增定义：
+ * celestine 只给出两个阿拉伯点，公式与昼夜（sect）判定在库内完成
+ * （dist/index.js:8670-8704）——
+ *   福点 Part of Fortune：昼 ASC + Moon − Sun；夜 ASC + Sun − Moon
+ *   精神点 Part of Spirit：取福点的反式
+ * 「sect / 昼夜」由太阳与上升的相对位置判定（dist/index.js:8533-8541），
+ * 与本仓的出生地输入无关地由库给出。
+ * 名称取通行中译：福点（别称财富点／幸运点）、精神点（别称灵点）。
+ */
+const LOT_META: Record<string, { key: string; name: string; latin: string; alias: string }> = {
+  "Part of Fortune": { key: "fortune", name: "福点", latin: "Part of Fortune", alias: "财富点／幸运点" },
+  "Part of Spirit": { key: "spirit", name: "精神点", latin: "Part of Spirit", alias: "灵点／灵魂点" },
+};
+
+export const buildAstroChart = (profile: NormalizedProfileInput): AstroChart => {
+  const datetime = getCivilDateTime(profile);
+  const [year, month, day, hour, minute, second] = parse(datetime);
+  const latitude = profile.original.location?.latitude ?? null;
+  const longitude = profile.original.location?.longitude ?? null;
+  const atPole = latitude !== null && Math.abs(latitude) === 90;
+  const hasPlace = latitude !== null && longitude !== null && !atPole;
+  const input = { datetime, timeZone: profile.normalized.timeZone, latitude, longitude };
+
+  // Planets and their aspects are geocentric, so the birth place never changes
+  // them; only the ascendant, midheaven and house cusps depend on it. Compute
+  // with a neutral origin and leave just the place-dependent fields absent when
+  // no location was given.
+  const chart = calculateChart({ year, month, day, hour, minute, second, timezone: offsetMinutes(datetime, profile.normalized.timeZone) / 60, latitude: hasPlace ? latitude : 0, longitude: hasPlace ? longitude : 0 });
+
+  const toPoint = (planet: { name: string; longitude: number; signName: string; house?: number }): AstroPoint => {
+    const signIndex = EN_SIGNS.indexOf(planet.signName);
+    return { name: PLANET_NAMES[planet.name] ?? planet.name, longitude: planet.longitude, sign: SIGNS[signIndex] ?? "未知", degree: degreeWithinSign(planet.longitude), house: hasPlace ? planet.house ?? null : null };
+  };
+  // 交点与莉莉丝不在 chart.planets 内，但 celestine 已在同一坐标系下算出，
+  // 且与行星之间已有相位；一并纳入 points，避免「相位与图形丢一半」的简化。
+  const nodeLike = [
+    // 交点：celestine 的 name 只有 "North/South Node"，需拼上 type。
+    ...chart.nodes.map((node) => ({ name: `${node.type} ${node.name}`, longitude: node.longitude, signName: node.signName, house: node.house })),
+    // 莉莉丝：celestine 的 name 已含 "Mean/True" 前缀（aspect 里也如此），不能再拼 type。
+    ...chart.lilith.map((item) => ({ name: item.name, longitude: item.longitude, signName: item.signName, house: item.house })),
+  ];
+  const points = [...chart.planets, ...nodeLike].filter((planet) => PLANET_NAMES[planet.name]).map(toPoint);
+  const ascendant = hasPlace ? toPoint({ name: "上升", longitude: chart.angles.ascendant.longitude, signName: chart.angles.ascendant.signName }) : emptyPoint("上升");
+  const angles = hasPlace
+    ? {
+        ascendant,
+        midheaven: toPoint({ name: "中天", longitude: chart.angles.midheaven.longitude, signName: chart.angles.midheaven.signName }),
+        descendant: toPoint({ name: "下降", longitude: chart.angles.descendant.longitude, signName: chart.angles.descendant.signName }),
+        imumCoeli: toPoint({ name: "天底", longitude: chart.angles.imumCoeli.longitude, signName: chart.angles.imumCoeli.signName }),
+      }
+    : { ascendant: emptyPoint("上升"), midheaven: emptyPoint("中天"), descendant: emptyPoint("下降"), imumCoeli: emptyPoint("天底") };
+
+  const aspects: AstroAspect[] = chart.aspects.all
+    .filter((aspect) => PLANET_NAMES[aspect.body1] && PLANET_NAMES[aspect.body2])
+    .map((aspect) => ({ body1: PLANET_NAMES[aspect.body1] ?? aspect.body1, body2: PLANET_NAMES[aspect.body2] ?? aspect.body2, type: aspect.type, symbol: aspect.symbol, separation: Number(aspect.separation.toFixed(2)), deviation: Number(aspect.deviation.toFixed(2)), strength: aspect.strength, isApplying: aspect.isApplying }));
+  const patterns: AstroPattern[] = chart.patterns
+    .filter((pattern) => pattern.bodies.every((body) => PLANET_NAMES[body]))
+    .map((pattern) => ({ type: pattern.type, bodies: pattern.bodies.map((body) => PLANET_NAMES[body] ?? body), description: pattern.description }));
+  const houses: AstroHouseCusp[] = hasPlace ? chart.houses.cusps.map((cusp) => ({ house: cusp.house, longitude: cusp.longitude, sign: SIGNS[cusp.sign] ?? "未知", degree: degreeWithinSign(cusp.longitude) })) : [];
+  const houseSystem = hasPlace ? chart.houses.systemName : atPole ? "—（地理极点，宫位未计算）" : "—（未提供出生地，宫位未计算）";
+  const aspectSummary = hasPlace
+    ? chart.aspects.summary
+    : aspects.reduce<Record<string, number>>((acc, aspect) => ({ ...acc, [aspect.type]: (acc[aspect.type] ?? 0) + 1 }), {});
+  // 阿拉伯点由上升点参与计算（ASC ± Sun/Moon），未提供出生地时上升点是占位值，
+  // 因而此时不输出 lots（与 angles / houses 同一处理原则）。
+  const lots: AstroLot[] = hasPlace
+    ? chart.lots
+        .filter((lot) => LOT_META[lot.name])
+        .map((lot) => {
+          const meta = LOT_META[lot.name];
+          const signIndex = EN_SIGNS.indexOf(lot.signName);
+          return {
+            key: meta.key,
+            name: meta.name,
+            latin: meta.latin,
+            alias: meta.alias,
+            formula: lot.formula,
+            sect: chart.calculated.isDaytime ? ("昼" as const) : ("夜" as const),
+            longitude: lot.longitude,
+            sign: SIGNS[signIndex] ?? "未知",
+            degree: degreeWithinSign(lot.longitude),
+            house: lot.house ?? null,
+          };
+        })
+    : [];
+
+  return {
+    format: "qmdj-astro-chart-v1",
+    input,
+    sun: points.find((point) => point.name === "太阳") ?? emptyPoint("太阳"),
+    moon: points.find((point) => point.name === "月亮") ?? emptyPoint("月亮"),
+    ascendant,
+    points,
+    angles,
+    houses,
+    houseSystem,
+    lots,
+    aspects,
+    aspectSummary,
+    patterns,
+    complete: hasPlace,
+    disclaimer: hasPlace
+      ? `研究性星盘：行星、小行星（谷神/智神/婚神/灶神/凯龙）、黄白交点、莉莉丝、宫位、四轴、相位与模式由 Celestine 天文计算引擎生成；宫制：${houseSystem}。阿拉伯点（${lots.map((lot) => lot.name).join("、") || "无"}）为古典／现代占星通行计算点（非天体），按 Celestine 的昼夜（sect）公式取值（福点昼 = ASC + Moon − Sun，夜 = ASC + Sun − Moon；精神点取反），本盘判定为${chart.calculated.isDaytime ? "昼盘" : "夜盘"}。不含恒星。结果不替代专业天文历表校核或现实决策，也不表示任何预测。`
+      : "行星、小行星、交点、莉莉丝与相位按地心坐标计算，不依赖出生地；上升、中天、宫位与阿拉伯点（福点、精神点）需要上升点，当前未计算。" + (atPole ? "地理极点无法确定常规升降轴。" : "请补充城市或经纬度后查看四轴、宫位与阿拉伯点。"),
+  };
+};
